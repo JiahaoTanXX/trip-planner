@@ -1,6 +1,6 @@
 # 智能旅游规划 Agent - 产品需求文档
 
-**文档版本**：v1.0.16
+**文档版本**：v1.0.20
 **最后更新**：2026-04-28
 
 ## 1. 产品概述
@@ -291,15 +291,14 @@
 > **单 Agent 架构（V1 简化）**：
 > - Planner Service：整合意图解析 + 行程生成，单次 MiniMax 调用完成
 > - Data Service：并行调用高德/携程 API 获取 POI 数据
-> - 超时策略：单步 API 超时 5s，整体行程生成超时 10s
-> - **待确认**：如 Multi-Agent 协调复杂度过高，可进一步简化为单 LLM 调用
+> - 超时策略：单步 API 超时 5s，**整体行程生成超时 15s**（10s 目标 + 5s buffer）
 
 ### 4.4 错误码与异常处理
 
 | 错误码 | 场景 | 用户提示 | 处理方式 |
 |--------|------|----------|----------|
 | E001 | 目的地无数据 | "暂未支持该城市的旅游规划" | 引导用户选择其他城市 |
-| E002 | 高德/携程 API 超时或失败 | "网络不稳定，请稍后重试" | 显示重试按钮（**不降级生成**） |
+| E002 | 高德 API 超时或失败 | "网络不稳定，请稍后重试" | 显示重试按钮（**高德失败不降级**） |
 | E003 | LLM 生成失败 | "行程生成失败，请稍后重试" | 初始生成失败自动重试一次；若仍失败显示用户提示（并非直接显示"E003"，而是显示"行程生成失败，请稍后重试"） |
 | E004 | 可选景点不足 | "可选景点不足，请调整偏好或选择其他城市" | 引导用户调整偏好或换城市 |
 
@@ -307,7 +306,8 @@
 > - 初始行程生成：LLM 调用失败时自动重试一次；若仍失败，返回 E003
 > - 用户触发重新生成：最多重试 3 次
 > - 每次重试后**不保存用户已填写的数据**，用户需重新填写表单
-> - 外部 API（高德/携程）失败时，不降级为纯 LLM 生成，直接返回 E002
+> - 高德 API 失败时，直接返回 E002（不降级）
+> - 携程 API 失败时，使用高德已有数据继续生成（可降级）
 >
 > **边界条件**：
 > - 景点数量不足：用户偏好排除后可选景点 < 1 个时，返回 E004（deep 模式 2 个景点为合法最低数量）
@@ -377,18 +377,18 @@ Trip-planner-v1/
 
 #### 4.5.4 Orchestrator 状态机设计
 
-> **待确认问题**：V1 是否需要异步 Orchestrator？
-> - **方案A（推荐）**：同步 Orchestrator，重新生成预计 10s 内完成，直接返回结果（去掉 202 Accepted）
-> - **方案B**：异步 Orchestrator，使用 FastAPI BackgroundTasks，保留 202 Accepted + 轮询
+> **已确认方案**：V1 采用**同步 Orchestrator**（方案A）
+> - 重新生成预计 10s 内完成，直接返回结果（去掉 202 Accepted）
+> - 前端无需轮询，简化实现复杂度
 
 | 状态 | 说明 |
 |------|------|
 | `pending` | 初始状态，接收请求 |
-| `processing` | 执行中（Intent 解析 / Data 获取 / Planner 生成） |
-| `completed` | 成功，返回行程 |
-| `failed` | 失败，返回错误码 |
+| `processing` | 执行中（Data 获取 / Planner 生成） |
+| `completed` | 成功，返回行程（201 Created） |
+| `failed` | 失败，返回错误码（E001-E004） |
 
-> **超时控制**：整体行程生成超时 10s，超时后返回 E003
+> **超时控制**：整体行程生成超时 15s，超时后返回 E003
 
 #### 4.5.5 重试退避策略
 
@@ -409,7 +409,7 @@ Trip-planner-v1/
 |------|------|------|
 | 页面加载 | < 2s（WiFi）/ < 4s（4G） | 首屏加载时间，桌面浏览器 |
 | API 响应 | < 500ms | 简单查询（地理编码、单 POI）；复杂查询（多 POI 路径规划）< 2s |
-| 行程生成 | < 10s | 包含 AI 行程生成 + 数据整合的总时间 |
+| 行程生成 | < 15s | 包含 AI 行程生成 + 数据整合的总时间（10s 性能目标 + 5s buffer） |
 
 ### 5.2 可用性要求
 | 指标 | 目标 | 说明 |
@@ -435,7 +435,7 @@ Trip-planner-v1/
 |------|----------|
 | 目的地输入 | 用户直接填入城市名，查询不到则提示 |
 | 表单必填校验 | 未填写时提示清晰，无法提交；日期不可选过去；人数×天数×日均消费与预算关联提示 |
-| 行程生成 | 点击后 10 秒内返回结果 |
+| 行程生成 | 点击后 15 秒内返回结果 |
 | 行程卡片 | 展示每日时间线、景点、建议、预计花费、景点距离 |
 | 地图展示 | 景点标注准确，路线连续 |
 | 行程导出 | 支持导出为图片（2x 分辨率）和 PDF（长图格式），无水印；导出失败时显示友好错误提示并提供重试按钮 |
@@ -455,6 +455,7 @@ Trip-planner-v1/
 | MiniMax JSON Schema 校验失败 | MiniMax 输出格式可能不稳定，需要多次校验和重试 | 增加格式校验和自动修复机制，重试 3 次仍失败返回 E003 |
 | 高德静态地图 API 限额 | 静态地图 API 每日调用限额 | 记录使用量，设计降级方案（如使用默认地图图片） |
 | html2canvas 截取地图成功率 | 地图是 canvas 元素，截取可能只获取空白 | 测试不同浏览器和设备，制定兼容性方案；PDF 使用服务端静态地图 API 替代 |
+| 外部 API 缺少熔断和限流 | 高德/携程 API 失败时直接返回 E002，无熔断机制；高频调用可能被限流 | V1 阶段：实现简单限流（**单 IP 每分钟 60 次，单用户每分钟 20 次**）；V2 考虑引入 pybreaker 熔断器 |
 
 ---
 
@@ -540,22 +541,23 @@ Trip-planner-v1/
        ↓
 2. FastAPI 参数校验（Pydantic）
        ↓
-3. Orchestrator.start()
+3. 检查城市是否支持 → 失败 → 返回 400 + E001
        ↓
-4. Intent Agent → MiniMax 解析需求，生成结构化描述
+4. Data Service 并行获取 POI 数据：
+   - 高德 POI 搜索景点（基于目的地 + include_tags，超时5s）
+   - 高德 POI 搜索住宿（基于目的地，超时5s）
+   - 携程获取景点详情（超时5s）
+   任一失败 → 返回 502 + E002
        ↓
-5. Data Agent 并行调用：
-   - 高德 POI 搜索景点（基于目的地 + include_tags）
-   - 高德 POI 搜索住宿（基于目的地）
-   - 携程获取景点详情（门票、评分）
+5. 检查景点数量 → 不足（< 1个）→ 返回 422 + E004
        ↓
-6. Planner Agent → MiniMax 基于 POI 数据生成行程 JSON
+6. 单 Planner Agent：MiniMax 生成行程 → 失败 → 重试1次（间隔1s）→ 返回 500 + E003
        ↓
-7. JSON Schema 校验输出（失败则触发 E003 重试）
+7. JSON Schema 校验 → 失败 → 重试1次（间隔1s）→ 返回 500 + E003
        ↓
 8. 存储行程到 MySQL（trips → days → trip_items/accommodations）
        ↓
-9. 返回行程给前端
+9. 返回行程给前端（同步返回，预计 < 15s）
 ```
 
 #### 导出流程
@@ -647,7 +649,6 @@ trips ──────── 1:N ──────── days
 | trip_id | BIGINT FK | → trips.id（反范式设计，方便直接查询） |
 | item_type | ENUM | **attraction**（restaurant 已删除，预留 V2） |
 | time_range | VARCHAR(20) | '09:00-12:00' |
-| time_range | VARCHAR(20) | '09:00-12:00' |
 | name | VARCHAR(100) | |
 | address | VARCHAR(200) | |
 | lat | DECIMAL(10,7) | |
@@ -687,10 +688,11 @@ trips ──────── 1:N ──────── days
 [3. 检查城市是否支持] → 失败 → 返回 400 + E001
         ↓
 [4. Data Service: 并行获取 POI 数据]
-   - 高德搜索景点 POI（超时5s）
-   - 高德搜索住宿 POI（超时5s）
-   - 携程获取景点详情（超时5s）
-   任一失败 → 返回 502 + E002
+   - 高德搜索景点 POI（超时5s，**核心数据**）
+   - 高德搜索住宿 POI（超时5s，**核心数据**）
+   - 携程获取景点详情（超时5s，**辅助数据，可降级**）
+   高德任一失败 → 返回 502 + E002
+   携程失败 → 降级继续（使用高德默认评分，门票=null）
         ↓
 [5. 检查景点数量是否满足最低阈值] → 不足 → 返回 422 + E004
         ↓
@@ -703,7 +705,7 @@ trips ──────── 1:N ──────── days
 [10. 返回行程给用户] → 201 Created
 ```
 
-> **超时控制**：整体行程生成超时 10s，超时后返回 E003
+> **超时控制**：整体行程生成超时 15s，超时后返回 E003
 
 #### 8.6.2 参数校验规则
 
@@ -727,20 +729,26 @@ trips ──────── 1:N ──────── days
 
 并行执行（超时：5秒/每个）：
 
-A. 高德搜索景点 POI
+A. 高德搜索景点 POI（**核心数据源**，必须成功）
    - keywords: include_tags
    - city: 目的地
    - 数量限制: 最多 50 个
 
-B. 高德搜索住宿 POI
+B. 高德搜索住宿 POI（**核心数据源**，必须成功）
    - keywords: [酒店、民宿]
    - city: 目的地
    - 数量限制: 最多 20 个
 
-C. 携程获取景点详情
+C. 携程获取景点详情（**辅助数据源**，可降级）
    - 获取: 门票价格、评分、电话
+   - 数量限制: 只处理高德返回的**前 20 个** POI（避免 API 限流）
+   - 批量获取减少调用次数
 
-失败策略：任一 API 超时/失败 → 整体失败 → E002（不降级）
+**降级策略**：
+- 高德景点/住宿搜索失败 → 整体失败 → E002
+- 携程获取详情失败 → 使用高德已有数据继续生成（评分使用高德默认值，门票价格设为 null）
+
+> **降级原因**：携程数据（门票价格、评分）是辅助信息，高德数据足以生成有效行程。携程失败不应阻塞核心流程。
 ```
 
 #### 8.6.4 子流程：单 Planner Agent（V1 简化）
@@ -754,13 +762,94 @@ C. 携程获取景点详情
 
 1. 构建 Prompt（包含目的地、可选 POI、用户偏好、行程规则）
 2. 调用 MiniMax API（temperature=0.8, max_tokens=4000）
+   > **参数说明**：temperature=0.8 平衡创造性和稳定性；max_tokens=4000 足够生成 7 天行程 JSON
 3. JSON 解析响应 → 失败则重试（间隔1s）
 4. 输出校验：
    - 必需字段存在
    - days 数量正确
-   - 每天景点数量符合 travel_style
+- 每天景点数量符合 travel_style
    - 失败则重试（间隔1s）
 ```
+
+#### 8.6.5 行程输出 JSON Schema（LLM 校验用）
+
+```json
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "required": ["trip_id", "destination", "days", "summary", "total_estimated_cost"],
+  "properties": {
+    "trip_id": { "type": "string", "format": "uuid" },
+    "destination": { "type": "string", "minLength": 1 },
+    "days": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/day" },
+      "minItems": 1,
+      "maxItems": 7
+    },
+    "summary": { "type": "string", "maxLength": 200 },
+    "total_estimated_cost": { "type": "number", "minimum": 0 }
+  },
+  "definitions": {
+    "day": {
+      "type": "object",
+      "required": ["day", "theme", "items", "accommodation"],
+      "properties": {
+        "day": { "type": "integer", "minimum": 1 },
+        "theme": { "type": "string", "maxLength": 50 },
+        "items": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/trip_item" }
+        },
+        "accommodation": { "$ref": "#/definitions/accommodation" }
+      }
+    },
+    "trip_item": {
+      "type": "object",
+      "required": ["type", "time", "poi"],
+      "properties": {
+        "type": { "type": "string", "enum": ["attraction"] },
+        "time": { "type": "string", "pattern": "^\\d{2}:\\d{2}-\\d{2}:\\d{2}$" },
+        "poi": {
+          "type": "object",
+          "required": ["name", "address", "lat", "lng"],
+          "properties": {
+            "name": { "type": "string" },
+            "address": { "type": "string" },
+            "lat": { "type": "number" },
+            "lng": { "type": "number" },
+            "ticket": { "type": ["number", "null"] },
+            "rating": { "type": ["number", "null"] },
+            "phone": { "type": ["string", "null"] },
+            "website": { "type": ["string", "null"] }
+          }
+        },
+        "estimated_cost": { "type": ["number", "null"] },
+        "distance_from_previous": { "type": ["string", "null"] },
+        "note": { "type": ["string", "null"] }
+      }
+    },
+    "accommodation": {
+      "type": "object",
+      "required": ["name", "address", "lat", "lng", "check_in_time"],
+      "properties": {
+        "name": { "type": "string" },
+        "address": { "type": "string" },
+        "lat": { "type": "number" },
+        "lng": { "type": "number" },
+        "check_in_time": { "type": "string" },
+        "phone": { "type": ["string", "null"] }
+      }
+    }
+  }
+}
+```
+
+> **校验规则**：
+> - `days` 数组长度必须与用户请求的 `days` 一致
+> - 每天景点数量：casual=1-2个，classic=2-3个，deep=1-2个
+> - `time` 格式必须为 "HH:MM-HH:MM"（24小时制）
+> - `poi.rating` 范围 1.0-5.0
 
 #### 8.6.6 导出行程流程
 
@@ -781,42 +870,31 @@ C. 携程获取景点详情
         ↓
 [2. 前端请求后端: GET /api/v1/trips/{trip_id}/export/map]
         ↓
-[3. 后端调用高德静态地图 API]
+[3. 后端调用高德静态地图 API（仅第一天行程的景点路线截图）]
         ↓
 [4. 前端使用 jsPDF 合成: 封面 + 地图截图 + 行程卡片]
         ↓
 [5. 触发浏览器下载]
 ```
 
+> **PDF 地图策略**：仅截取第一天行程的景点路线图作为整体示意，避免 7 天行程需要调用 7 次高德静态地图 API 而快速耗尽配额。
+
 #### 8.6.7 重新生成流程
 
-> **待确认问题**：重新生成使用同步返回（10s 内）还是异步返回（202 + 轮询）？
+> **已确认**：采用**同步返回**（方案A），重新生成预计 15s 内完成，直接返回结果
 
-**方案A（推荐 - 同步返回）**：
+**同步返回流程**：
 ```
 [1. 用户点击"重新生成"]
         ↓
-[2. 检查重试次数: regenerate_count ≥ 3?] → 是 → 返回 429
+[2. 检查重试次数: regenerate_count ≥ 4?] → 是 → 返回 429
         ↓
 [3. 递增重试次数（间隔退避：1s → 2s → 4s）]
-[4. 执行行程生成流程（同步，10s 内返回）]
+[4. 执行行程生成流程（同步，15s 内返回）]
 [5. 返回 201 或错误]
 ```
 
-**方案B（异步返回）**：
-```
-[1. 用户点击"重新生成"]
-        ↓
-[2. 检查重试次数: regenerate_count ≥ 3?] → 是 → 返回 429
-        ↓
-[3. 递增重试次数，更新 status='regenerating']
-[4. 后台执行行程生成流程]
-[5. 返回 202 Accepted]
-        ↓
-[6. 前端轮询 GET /api/v1/trips/{trip_id}（间隔2s，超时60s）]
-   - status='completed' → 展示新行程
-   - status='failed' → 显示错误
-```
+> **regenerate_count 说明**：已重试次数，初始为 0。最大尝试次数 = 初始 1 次 + 重试 3 次 = 4 次。
 
 #### 8.6.8 城市验证流程
 
@@ -941,15 +1019,17 @@ C. 携程获取景点详情
 }
 ```
 
-**Response 200 (无效):**
+**Response 400 (无效 - 城市不存在):**
 ```json
 {
-  "valid": false,
-  "message": "暂未支持该城市的旅游规划"
+  "error": {
+    "code": "E001",
+    "message": "暂未支持该城市的旅游规划"
+  }
 }
 ```
 
-**错误码：** E001
+**错误码：** E001（城市不存在）
 
 ---
 
@@ -1069,18 +1149,34 @@ C. 携程获取景点详情
 
 **POST** `/api/v1/trips/{trip_id}/regenerate`
 
-基于原始偏好重新生成行程。
+基于原始偏好重新生成行程（同步返回）。
 
-**Response 202:**
+**重试规则**：
+- `regenerate_count`：已重试次数（初始为 0）
+- 总尝试次数 = 初始尝试 1 次 + 重试 3 次 = 最多 4 次
+- `regenerate_count ≥ 4` 时返回 429
+
+**Response 201:**
 ```json
 {
   "trip_id": "uuid-string",
-  "status": "regenerating",
-  "message": "行程重新生成中，请稍后查询"
+  "status": "completed",
+  "destination": "上海",
+  "days": [...],
+  "summary": "3天2晚上海经典之旅",
+  "total_estimated_cost": 380
 }
 ```
 
-轮询 `GET /api/v1/trips/{trip_id}` 获取结果。
+**Response 429 (重试次数超限):**
+```json
+{
+  "error": {
+    "code": "E429",
+    "message": "重试次数超限，请稍后再试"
+  }
+}
+```
 
 **Response 404:**
 ```json
@@ -1092,7 +1188,7 @@ C. 携程获取景点详情
 }
 ```
 
-**错误码：** E003（重试次数超限，返回 429）
+**错误码：** E003（生成失败）、E429（重试次数超限）
 
 ---
 
