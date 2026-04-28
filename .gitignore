@@ -31,3 +31,7 @@ Thumbs.db
 backend/
 frontend/
 *.md.bak
+
+# Local files (not for GitHub)
+agent.md
+review.md
